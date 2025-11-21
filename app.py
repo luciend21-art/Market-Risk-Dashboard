@@ -233,22 +233,42 @@ vix_plot_df = vix_plot_df.set_index("Date").join(
 )
 
 vix_plot_df["VIX"] = pd.to_numeric(vix_plot_df["VIX"], errors="coerce")
+vix_plot_df["vix_sd"] = pd.to_numeric(vix_plot_df["vix_sd"], errors="coerce")
+vix_plot_df["vvix_sd"] = pd.to_numeric(vix_plot_df["vvix_sd"], errors="coerce")
 vix_plot_df = vix_plot_df.dropna(subset=["VIX"])
 
 base_vix = alt.Chart(vix_plot_df.reset_index()).properties(height=350)
 
-vix_line = base_vix.mark_line(color="#FFFFFF", strokeWidth=2).encode(
+# Main VIX line (use bright color, not white)
+vix_line = base_vix.mark_line(color="#4CC9F0", strokeWidth=2).encode(
     x="Date:T",
     y=alt.Y("VIX:Q", title="VIX")
 )
 
+# Optional: show VIX and VVIX 20d stdev for context
+vix_sd_line = base_vix.mark_line(color="#F9C74F", strokeDash=[4, 4]).encode(
+    x="Date:T",
+    y=alt.Y("vix_sd:Q", title="VIX / SD"),
+)
+
+vvix_sd_line = base_vix.mark_line(color="#90BE6D", strokeDash=[2, 4]).encode(
+    x="Date:T",
+    y="vvix_sd:Q",
+)
+
+# Tsunami points on the VIX line
 tsu_pts = base_vix.mark_point(color="red", size=120, shape="diamond").encode(
     x="Date:T",
     y="VIX:Q",
 ).transform_filter("datum.tsunami == true")
 
-st.altair_chart(vix_line + tsu_pts, use_container_width=True)
-st.caption("White: VIX. Red diamonds: Tsunami compression signals (VIX + VVIX SD).")
+st.altair_chart(vix_line + vix_sd_line + vvix_sd_line + tsu_pts,
+                use_container_width=True)
+
+st.caption(
+    "Blue: VIX. Yellow/Green: 20-day stdev of VIX/VVIX. "
+    "Red diamonds: Volatility Tsunami compression signals."
+)
 
 # -----------------------------
 # SPY / TLT Ratio
