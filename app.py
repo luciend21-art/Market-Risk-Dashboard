@@ -432,7 +432,10 @@ else:
 
 # 🔍 Limit to last ~3 months on price charts
 lookback_days = 90
-cutoff = end_date - dt.timedelta(days=lookback_days)
+# OLD:
+# cutoff = end_date - dt.timedelta(days=lookback_days)
+# NEW:
+cutoff = pd.Timestamp(end_date - dt.timedelta(days=lookback_days))
 
 spy_tf = spy_tf[spy_tf.index >= cutoff]
 qqq_tf = qqq_tf[qqq_tf.index >= cutoff]
@@ -440,37 +443,6 @@ qqq_tf = qqq_tf[qqq_tf.index >= cutoff]
 spy_can_tf = spy_can_tf.loc[spy_tf.index]
 qqq_can_tf = qqq_can_tf.loc[qqq_tf.index]
 spy_regime_tf = spy_regime_tf.loc[spy_tf.index]
-
-# Regime light
-light = regime_light_from_label(regime_label)
-
-# SPY chart
-spy_col1, spy_col2 = st.columns([4, 1])
-with spy_col1:
-    st.subheader("SPY with 5% Canary Signals")
-with spy_col2:
-    st.markdown(f"### {light}")
-
-st.altair_chart(
-    make_price_chart(spy_tf, spy_can_tf, "SPY"),
-    use_container_width=True
-)
-
-# QQQ chart
-qqq_regime = regime_series(qqq_can_tf, tsu_df)
-
-qqq_col1, qqq_col2 = st.columns([4, 1])
-with qqq_col1:
-    st.subheader("QQQ (NASDAQ) with 5% Canary Signals")
-with qqq_col2:
-    st.markdown(f"### {light}")
-
-st.altair_chart(
-    make_price_chart(qqq_tf, qqq_can_tf, "QQQ"),
-    use_container_width=True
-)
-
-st.markdown("---")
 
 # -----------------------------
 # VIX & Volatility Tsunami Watch (Daily / Weekly)
