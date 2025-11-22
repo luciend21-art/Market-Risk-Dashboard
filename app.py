@@ -61,7 +61,7 @@ def pct_above_ema50_proxy(close_series):
     return 100.0 if above else 0.0
 
 # -----------------------------
-# 5% Canary Logic (applies to SPY & QQQ)
+# 5% Canary Logic (SPY & QQQ)
 # -----------------------------
 def compute_canary(close_series,
                    fast_bars=15,
@@ -214,7 +214,6 @@ qqq_trend = trend_label(qqq)
 # Recommendation Engine
 # -----------------------------
 def recommendation(spy_state, tsunami_on, spy_trend, spy_breadth):
-    # spy_state is text returned earlier
     if "CONFIRMED" in spy_state:
         if tsunami_on:
             regime = "Purple / Red – Confirmed Canary + Tsunami"
@@ -279,6 +278,21 @@ regime_label, regime_msg = recommendation(
     spy_state_text, tsunami_active, spy_trend, spy_breadth
 )
 
+def regime_light_from_label(label: str) -> str:
+    """Return a colored dot/emoji based on the current regime label."""
+    l = label.lower()
+    if "purple" in l:
+        return "🟣"
+    if "red" in l:
+        return "🔴"
+    if "orange" in l:
+        return "🟠"
+    if "yellow" in l:
+        return "🟡"
+    if "green" in l:
+        return "🟢"
+    return "⚪"
+
 # -----------------------------
 # Top Summary Row
 # -----------------------------
@@ -313,17 +327,15 @@ st.markdown("---")
 # Recommendation Panel
 # -----------------------------
 st.subheader("Regime & Positioning Guidance")
-
 st.markdown(f"**Regime:** {regime_label}")
 st.write(regime_msg)
 
 st.markdown("---")
 
 # -----------------------------
-# Regime color helper
+# Regime series helper (still used to tag canary states)
 # -----------------------------
 def regime_series(canary_df, tsunami_df=None):
-    # Build per-date regime label
     df = pd.DataFrame(index=canary_df.index)
     df["regime"] = "Normal"
 
@@ -340,11 +352,6 @@ def regime_series(canary_df, tsunami_df=None):
 
 spy_regime = regime_series(spy_canary, tsu_df)
 
-regime_scale = alt.Scale(
-    domain=["Normal", "Slow", "Fast", "Confirmed", "Tsunami"],
-    range=["#00000000", "#2ecc7133", "#f1c40f33", "#e67e2233", "#9b59b633"],
-)
-
 # -----------------------------
 # SPY & QQQ Charts (Daily / Weekly)
 # -----------------------------
@@ -355,35 +362,23 @@ tf_choice = st.radio(
     key="tf_prices"
 )
 
-def make_price_chart(close_series, canary_df, regime_df, label, is_spy=True):
-    # Select timeframe (already applied outside if needed)
+def make_price_chart(close_series, canary_df, label):
     df = pd.DataFrame({"close": close_series})
     df["Date"] = df.index
 
     if tf_choice == "Daily":
         df["ema_short"] = ema(df["close"], 21)
         df["ema_long"] = ema(df["close"], 200)
-        short_label = "21-EMA"
-        long_label = "200-EMA"
     else:  # Weekly
         df["ema_short"] = ema(df["close"], 10)
         df["ema_long"] = ema(df["close"], 40)
-        short_label = "10-week EMA"
-        long_label = "40-week EMA"
 
     merged = df.set_index("Date").join(
         canary_df[["slow_canary", "fast_canary", "confirmed_canary"]]
-    ).join(regime_df[["regime"]])
-
+    )
     merged = merged.reset_index().rename(columns={"index": "Date"})
 
     base = alt.Chart(merged).properties(height=350)
-
-    # Regime background
-    regime_rect = base.mark_rect().encode(
-        x="Date:T",
-        color=alt.Color("regime:N", scale=regime_scale, legend=None)
-    )
 
     price_line = base.mark_line(color="#4CC9F0", strokeWidth=2).encode(
         x="Date:T",
@@ -416,9 +411,8 @@ def make_price_chart(close_series, canary_df, regime_df, label, is_spy=True):
         y="close:Q",
     ).transform_filter("datum.confirmed_canary == true")
 
-    chart = regime_rect + price_line + ema_short_line + ema_long_line + slow_pts + fast_pts + conf_pts
+    chart = price_line + ema_short_line + ema_long_line + slow_pts + fast_pts + conf_pts
     return chart
-
 
 # Resample for weekly if needed
 if tf_choice == "Weekly":
@@ -428,7 +422,6 @@ if tf_choice == "Weekly":
     spy_can_tf = compute_canary(spy_tf)
     qqq_can_tf = compute_canary(qqq_tf)
 
-    # For regimes, reuse daily Tsunami; align by date
     spy_regime_tf = regime_series(spy_can_tf, tsu_df)
 else:
     spy_tf = spy
@@ -437,16 +430,43 @@ else:
     qqq_can_tf = qqq_canary
     spy_regime_tf = spy_regime
 
-st.subheader("SPY with 5% Canary Signals")
+# 🔍 Limit to last ~3 months on price charts
+lookback_days = 90
+cutoff = end_date - dt.timedelta(days=lookback_days)
+
+spy_tf = spy_tf[spy_tf.index >= cutoff]
+qqq_tf = qqq_tf[qqq_tf.index >= cutoff]
+
+spy_can_tf = spy_can_tf.loc[spy_tf.index]
+qqq_can_tf = qqq_can_tf.loc[qqq_tf.index]
+spy_regime_tf = spy_regime_tf.loc[spy_tf.index]
+
+# Regime light
+light = regime_light_from_label(regime_label)
+
+# SPY chart
+spy_col1, spy_col2 = st.columns([4, 1])
+with spy_col1:
+    st.subheader("SPY with 5% Canary Signals")
+with spy_col2:
+    st.markdown(f"### {light}")
+
 st.altair_chart(
-    make_price_chart(spy_tf, spy_can_tf, spy_regime_tf, "SPY"),
+    make_price_chart(spy_tf, spy_can_tf, "SPY"),
     use_container_width=True
 )
 
-st.subheader("QQQ (NASDAQ) with 5% Canary Signals")
-qqq_regime = regime_series(qqq_can_tf, tsu_df)  # simple reuse of Tsunami
+# QQQ chart
+qqq_regime = regime_series(qqq_can_tf, tsu_df)
+
+qqq_col1, qqq_col2 = st.columns([4, 1])
+with qqq_col1:
+    st.subheader("QQQ (NASDAQ) with 5% Canary Signals")
+with qqq_col2:
+    st.markdown(f"### {light}")
+
 st.altair_chart(
-    make_price_chart(qqq_tf, qqq_can_tf, qqq_regime, "QQQ"),
+    make_price_chart(qqq_tf, qqq_can_tf, "QQQ"),
     use_container_width=True
 )
 
