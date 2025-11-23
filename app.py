@@ -380,20 +380,26 @@ def main():
         st.caption(tsunami_info["detail"])
 
     # Market snapshot (SPY, QQQ, % off high)
-    with col_snapshot:
-        st.subheader("Market Snapshot")
+    with col3:
+    st.subheader("Market Snapshot")
 
-        def pct_off_high(series: pd.Series) -> float:
-            recent_high = series.rolling(252).max().iloc[-1]
-            return (series.iloc[-1] / recent_high - 1.0) * 100.0
+    # Latest prices
+    spy_last = float(spy_full["Close"].iloc[-1])
+    qqq_last = float(qqq_full["Close"].iloc[-1])
 
-        spy_off = pct_off_high(spy_full["Close"])
-        qqq_off = pct_off_high(qqq_full["Close"])
+    # % off 52-week high
+    spy_off = pct_off_high(spy_full["Close"])
+    qqq_off = pct_off_high(qqq_full["Close"])
 
-        st.write(f"SPY: {spy_full['Close'].iloc[-1]:.2f}")
-        st.write(f"Off 52-week high: {spy_off:.1f}%")
-        st.write(f"QQQ: {qqq_full['Close'].iloc[-1]:.2f}")
-        st.write(f"QQQ off 52-week high: {qqq_off:.1f}%")
+    st.write(f"SPY: {spy_last:,.2f}")
+    st.write(f"Off 52-week high: {spy_off:.1f}%")
+
+    st.write(f"QQQ: {qqq_last:,.2f}")
+    st.write(f"QQQ off 52-week high: {qqq_off:.1f}%")
+
+    # VIX snapshot
+    vix_last = float(vix_full["Close"].iloc[-1])
+    st.write(f"VIX: {vix_last:.2f}")
 
     # Breadth proxy via % above 50-EMA (approx using 50-day EMA via EWM)
     with col_breadth:
