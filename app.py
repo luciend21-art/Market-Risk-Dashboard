@@ -52,35 +52,41 @@ def load_data():
 # -----------------------------
 # Canary logic
 # -----------------------------
-def canary_status(df: pd.DataFrame, lookback_days: int = 252):
-    """
-    Simple Canary status based on % off 1-year high.
-    Returns (emoji, headline, detail, pct_off).
-    """
-    if df.empty or "Close" not in df.columns:
-        return "⚪", "No data", "No price data available.", np.nan
+def canary_status(df: pd.DataFrame):
+    """High-level Canary regime based on SPY 1-year drawdown."""
+    closes = df["Close"].astype(float)
 
-    closes = df["Close"].tail(lookback_days)
-    if closes.empty:
-        return "⚪", "No data", "Not enough history.", np.nan
+    # 1-year rolling high (approx 252 trading days)
+    high_1y_series = closes.rolling(window=252, min_periods=1).max()
 
-    high_1y = closes.max()
-    last = closes.iloc[-1]
-    pct_off = (last / high_1y - 1.0) * 100.0
+    # Use only the most recent values for the status
+    last_close = float(closes.iloc[-1])
+    last_high_1y = float(high_1y_series.iloc[-1])
+
+    # Guard against weird data (all NaNs, etc.)
+    if pd.isna(last_high_1y) or last_high_1y == 0:
+        return "⚪", "No Canary reading", "Insufficient data for 1-year high.", np.nan
+
+    pct_off = (last_close / last_high_1y - 1.0) * 100.0  # negative = below high
 
     if pct_off >= -5.0:
         emoji = "🟢"
         headline = "Shallow pullback (<5% from 1-year high)"
+        detail = f"SPY is {pct_off:.1f}% below its 1-year high. No Canary warning."
     elif pct_off >= -10.0:
         emoji = "🟡"
-        headline = "Canary caution (5–10% below 1-year high)"
+        headline = "Moderate pullback (5–10% from 1-year high)"
+        detail = (
+            f"SPY is {pct_off:.1f}% below its 1-year high. Stay alert and tighten risk."
+        )
     else:
         emoji = "🔴"
-        headline = "Confirmed Canary (>10% below 1-year high)"
+        headline = "Deep pullback (>10% from 1-year high)"
+        detail = (
+            f"SPY is {pct_off:.1f}% below its 1-year high. Treat this as a high-risk zone."
+        )
 
-    detail = f"SPY is {abs(pct_off):.1f}% below its 1-year high."
     return emoji, headline, detail, pct_off
-
 
 # -----------------------------
 # Tsunami logic
