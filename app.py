@@ -1,449 +1,488 @@
-# app.py  – Market Risk Dashboard (5% Canary + Volatility Tsunami)
-
 import datetime as dt
-from dateutil.relativedelta import relativedelta
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-
 import plotly.graph_objects as go
 
-# ------------------------------------------------------------------
-# Config
-# ------------------------------------------------------------------
 
-START_DATE = "2015-01-01"
-LOOKBACK_DAYS_PRICE = 90          # 3-month zoom for SPY/QQQ
-TSUNAMI_LOOKBACK_DAYS = 120       # window to scan for Tsunami signals
+# ----------------------------
+# Data loading & basic helpers
+# ----------------------------
 
-st.set_page_config(
-    page_title="Market Risk Dashboard",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+@st.cache_data(ttl=3600)
+def load_data():
+    """Download SPY, QQQ, VIX, VVIX with enough history for EMAs and signals."""
+    end = dt.date.today()
+    start = end - dt.timedelta(days=800)  # a bit over 3 years
 
-# ------------------------------------------------------------------
-# Data helpers
-# ------------------------------------------------------------------
+    spy = yf.download("SPY", start=start, end=end, progress=False)
+    qqq = yf.download("QQQ", start=start, end=end, progress=False)
+    vix = yf.download("^VIX", start=start, end=end, progress=False)
+    vvix = yf.download("^VVIX", start=start, end=end, progress=False)
 
+    # Just in case, drop any rows without Close data
+    spy = spy.dropna(subset=["Close"])
+    qqq = qqq.dropna(subset=["Close"])
+    vix = vix.dropna(subset=["Close"])
+    vvix = vvix.dropna(subset=["Close"])
 
-def load_price_history(symbol: str, start: str = START_DATE) -> pd.DataFrame:
-    """Download full daily close series and compute EMAs on full history."""
-    df = yf.download(symbol, start=start, progress=False)
-    if df.empty:
-        raise ValueError(f"No data returned for {symbol}")
-    df = df[["Close"]].copy()
-    df.index = pd.to_datetime(df.index)
-    df["EMA21"] = df["Close"].ewm(span=21, adjust=False).mean()
-    df["EMA200"] = df["Close"].ewm(span=200, adjust=False).mean()
-    return df
+    return spy, qqq, vix, vvix
 
 
-def slice_recent(df: pd.DataFrame, days: int) -> pd.DataFrame:
-    """Return only the last `days` calendar days for plotting."""
-    last_date = df.index.max()
-    cutoff = last_date - pd.Timedelta(days=days)
-    return df[df.index >= cutoff].copy()
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
 
 
-def load_vix_vvix(start: str = START_DATE) -> pd.DataFrame:
-    """Load VIX and VVIX and compute 20-day stdevs & z-scores."""
-    vix = yf.download("^VIX", start=start, progress=False)[["Close"]].rename(
-        columns={"Close": "VIX"}
-    )
-    vvix = yf.download("^VVIX", start=start, progress=False)[["Close"]].rename(
-        columns={"Close": "VVIX"}
-    )
-
-    df = vix.join(vvix, how="inner")
-    df.index = pd.to_datetime(df.index)
-
-    # 20-day rolling stdev
-    df["VIX_SD20"] = df["VIX"].rolling(20).std()
-    df["VVIX_SD20"] = df["VVIX"].rolling(20).std()
-
-    # 1-year rolling baseline for z-scores
-    base_win = 252
-    df["VIX_SD20_Z"] = (
-        df["VIX_SD20"] - df["VIX_SD20"].rolling(base_win).mean()
-    ) / df["VIX_SD20"].rolling(base_win).std()
-    df["VVIX_SD20_Z"] = (
-        df["VVIX_SD20"] - df["VVIX_SD20"].rolling(base_win).mean()
-    ) / df["VVIX_SD20"].rolling(base_win).std()
-
-    # Tsunami rule (you can refine thresholds later)
-    df["Tsunami"] = (df["VIX_SD20_Z"] > 1.0) & (df["VVIX_SD20_Z"] > 1.0)
-
-    return df
+def last_close(df: pd.DataFrame) -> float:
+    """Return latest closing price as a float."""
+    return float(df["Close"].iloc[-1])
 
 
-# ------------------------------------------------------------------
-# Canary regime logic (SPY / QQQ)
-# ------------------------------------------------------------------
-
-
-def canary_regime_from_close(
-    close: pd.Series, ema_long: pd.Series, *, dd_threshold: float = -5.0
-) -> dict:
+def pct_off_high(series: pd.Series, lookback_days: int = 252) -> float:
     """
-    Approximate 5% Canary regime based on:
-      - Drawdown from 1-year high
-      - Speed of the drop (bars from peak)
-      - Position vs long EMA (for 'confirmed')
-    Returns dict with 'label' and 'color' (for flashlight).
+    Percent off the highest close in the last `lookback_days`.
+    Negative value means below the high.
     """
-    out = {"label": "No active Canary signal", "color": "🟢"}
+    recent = series.tail(lookback_days)
+    high = float(recent.max())
+    last = float(recent.iloc[-1])
+    return (last / high - 1.0) * 100.0
 
-    if len(close) < 260:
-        return out
 
-    close = close.dropna()
-    ema_long = ema_long.reindex(close.index).dropna()
+# ----------------------------
+# 5% Canary detection
+# ----------------------------
 
-    # 1-year rolling high on full series
-    high_1y = close.rolling(252).max()
+def detect_canary(
+    df: pd.DataFrame,
+    lookback_days: int = 252,
+    fast_bars: int = 10,
+    confirm_bars: int = 60,
+    long_ema_len: int = 200,
+):
+    """
+    Very lightweight approximation of your 5% Canary logic.
 
-    last_close = float(close.iloc[-1])
-    last_high = float(high_1y.iloc[-1])
+    - When drawdown from 1-year high first reaches -5%, mark:
+        * 'fast' if it happened within `fast_bars` after the high
+        * otherwise 'slow'
+    - If a fast drop is followed (within `confirm_bars`) by a close below
+      the long EMA, mark 'confirmed'.
+    """
+    close = df["Close"]
+    high_1y = close.rolling(window=lookback_days, min_periods=1).max()
+    long_ema = ema(close, long_ema_len)
 
-    if np.isnan(last_high):
-        return out
+    index = close.index
+    slow = pd.Series(False, index=index)
+    fast = pd.Series(False, index=index)
+    confirmed = pd.Series(False, index=index)
 
-    drop_pct = (last_close / last_high - 1.0) * 100.0
+    last_high_idx = None
+    last_fast_idx = None
 
-    # Bars from that 1-year high
-    idx_last = close.index[-1]
-    # choose the *last* time we made that 1-year high
-    high_mask = high_1y == last_high
-    high_idx = high_1y[high_mask].index[-1]
-    bars_from_high = np.sum(close.index >= high_idx)
+    for i, (idx, c) in enumerate(close.items()):
+        # Track "local" 1y high index
+        if high_1y.iloc[i] == 0 or np.isnan(high_1y.iloc[i]):
+            continue
 
-    fast_window = 21  # ~1 trading month
+        if c >= high_1y.iloc[i] * 0.999:
+            last_high_idx = i
 
-    if drop_pct <= dd_threshold:
-        # 5% off the highs
-        if bars_from_high <= fast_window:
-            # Fast 5% drop
-            if last_close < float(ema_long.iloc[-1]):
-                out["label"] = "Confirmed 5% Canary (fast drop, below long EMA)"
-                out["color"] = "🔴"
-            else:
-                out["label"] = "Fast 5% Canary (watch risk, hedge)"
-                out["color"] = "🟡"
-        else:
-            # Slow 5% pullback
-            out["label"] = "Slow 5% Canary (buy-the-dip setup)"
-            out["color"] = "🟢"
+        # Drawdown from 1-year high
+        drop_pct = (c / high_1y.iloc[i] - 1.0) * 100.0
+
+        # First time reaching -5% after a high
+        if drop_pct <= -5.0 and last_high_idx is not None:
+            bars_from_high = i - last_high_idx
+            # Only trigger once per leg down
+            if not (slow.iloc[i] or fast.iloc[i]):
+                if bars_from_high <= fast_bars:
+                    fast.iloc[i] = True
+                    last_fast_idx = i
+                else:
+                    slow.iloc[i] = True
+
+        # Confirmation: close below long EMA within confirm window after fast drop
+        if last_fast_idx is not None and (i - last_fast_idx) <= confirm_bars:
+            if c < long_ema.iloc[i]:
+                confirmed.iloc[i] = True
+                # Only need the first confirmation
+                last_fast_idx = None
+
+    flags_df = pd.DataFrame(
+        {"slow": slow, "fast": fast, "confirmed": confirmed}
+    )
+
+    # Determine the most recent and most severe event for regime label
+    last_idx = None
+    last_type = None
+
+    for t in ["confirmed", "fast", "slow"]:
+        s = flags_df[t]
+        if s.any():
+            idx_last = s[s].index[-1]
+            if last_idx is None or idx_last > last_idx:
+                last_idx = idx_last
+                last_type = t
+
+    if last_type == "confirmed":
+        regime = "Confirmed Canary"
+    elif last_type == "fast":
+        regime = "Fast 5% drop"
+    elif last_type == "slow":
+        regime = "Slow 5% (Buy-the-Dip)"
     else:
-        # No 5% canary, but could still be shallow pullback
-        if drop_pct <= -3:
-            out["label"] = "Shallow pullback (<5% from 1-year high)"
-            out["color"] = "🟢"
-        else:
-            out["label"] = "Near highs (no Canary)"
-            out["color"] = "🟢"
+        regime = "No active Canary signal"
 
-    return out
-
-
-# ------------------------------------------------------------------
-# Chart builders
-# ------------------------------------------------------------------
+    return {
+        "flags": flags_df,
+        "regime": regime,
+        "last_type": last_type,
+        "last_date": last_idx,
+    }
 
 
-def build_price_chart(
-    df_full: pd.DataFrame,
-    price_name: str,
-    symbol: str,
-    lookback_days: int = LOOKBACK_DAYS_PRICE,
-) -> tuple[go.Figure, dict]:
-    """
-    Build SPY/QQQ daily price chart with 21 & 200 EMAs.
-    Returns (fig, canary_info).
-    """
-    # Canary regime uses **full history**
-    canary_info = canary_regime_from_close(
-        df_full["Close"], df_full["EMA200"], dd_threshold=-5.0
+def canary_panel_text(canary_info: dict, df_full: pd.DataFrame):
+    """Return emoji + text for the Canary status panel."""
+    last_type = canary_info["last_type"]
+
+    if last_type == "confirmed":
+        return "🔴", "Confirmed Canary – high risk, defense first."
+
+    if last_type == "fast":
+        return "🟠", "Fast 5% drop – early warning. Tighten risk and consider hedges."
+
+    if last_type == "slow":
+        return "🟢", "Slow 5% (Buy-the-Dip) signal – constructive, but manage size."
+
+    # No explicit canary – describe the drawdown from 1-year high
+    close = df_full["Close"]
+    high_1y = close.rolling(252, min_periods=1).max()
+    dd = (close.iloc[-1] / high_1y.iloc[-1] - 1.0) * 100.0
+
+    if dd > -5.0:
+        return "🟢", f"Shallow pullback ({dd:.1f}% off 1-year high)."
+    else:
+        return "🟡", f"No Canary trigger; {dd:.1f}% off 1-year high."
+
+
+# ----------------------------
+# Volatility Tsunami (daily)
+# ----------------------------
+
+def compute_tsunami_daily(vix_df: pd.DataFrame, vvix_df: pd.DataFrame) -> pd.DataFrame:
+    """Build a daily dataframe with VIX/VVIX 20-day stdevs and a compression signal."""
+    vix = vix_df["Close"]
+    vvix = vvix_df["Close"]
+
+    vix_ret = vix.pct_change()
+    vvix_ret = vvix.pct_change()
+
+    vix_sd20 = vix_ret.rolling(20).std() * 100.0
+    vvix_sd20 = vvix_ret.rolling(20).std() * 100.0
+
+    # Compression thresholds based on low decile over the past ~1y
+    lookback = 252
+    th_vix = vix_sd20.rolling(lookback, min_periods=60).quantile(0.10)
+    th_vvix = vvix_sd20.rolling(lookback, min_periods=60).quantile(0.10)
+
+    signal = (vix_sd20 < th_vix) & (vvix_sd20 < th_vvix)
+
+    df = pd.DataFrame(
+        {
+            "VIX": vix,
+            "VIX_SD20": vix_sd20,
+            "VVIX_SD20": vvix_sd20,
+            "signal": signal,
+        }
     )
 
-    # Plot only recent slice for readability
-    df_plot = slice_recent(df_full, lookback_days)
-
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Scatter(
-            x=df_plot.index,
-            y=df_plot["Close"],
-            mode="lines",
-            name=price_name,
-            line=dict(width=2),
-        )
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=df_plot.index,
-            y=df_plot["EMA21"],
-            mode="lines",
-            name="21-day EMA",
-            line=dict(width=1.5, dash="dash"),
-        )
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=df_plot.index,
-            y=df_plot["EMA200"],
-            mode="lines",
-            name="200-day EMA",
-            line=dict(width=1.5, dash="dot"),
-        )
-    )
-
-    # Last swing-low (3-month low)
-    recent_low = df_plot["Close"].min()
-    fig.add_trace(
-        go.Scatter(
-            x=[df_plot.index.min(), df_plot.index.max()],
-            y=[recent_low, recent_low],
-            mode="lines",
-            name="Recent swing-low",
-            line=dict(width=1, dash="dot"),
-            showlegend=True,
-        )
-    )
-
-    fig.update_layout(
-        height=350,
-        margin=dict(l=40, r=20, t=50, b=40),
-        showlegend=True,
-        xaxis_title="Date",
-        yaxis_title=f"{symbol} Price",
-    )
-
-    subtitle = (
-        "Blue: price, Orange: 21-day EMA, Green: 200-day EMA. "
-        "Dotted line: most recent swing-low."
-    )
-
-    return fig, {"subtitle": subtitle, **canary_info}
+    return df
 
 
-def build_vix_chart(
-    vix_df: pd.DataFrame, timeframe: str = "Daily"
-) -> tuple[go.Figure, dict]:
-    """
-    Build VIX & Volatility Tsunami chart and return (fig, tsunami_info).
-    """
-    df = vix_df.copy()
+def tsunami_status(tsunami_df: pd.DataFrame, window_days: int = 120) -> dict:
+    """Return whether a Tsunami compression has fired in the recent window."""
+    recent = tsunami_df.tail(window_days)
+    if recent["signal"].any():
+        idx = recent[recent["signal"]].index[-1]
+        return {"has_signal": True, "last_date": idx}
+    return {"has_signal": False, "last_date": None}
+
+
+def build_vix_chart(tsunami_df: pd.DataFrame, timeframe: str) -> go.Figure:
+    """Plot VIX, its 20-day stdev, and VVIX 20-day stdev, with Tsunami diamonds."""
+    df = tsunami_df.copy()
 
     if timeframe == "Weekly":
-        # Resample to weekly (Friday close)
-        df = (
-            df.resample("W-FRI")
-            .agg(
-                {
-                    "VIX": "last",
-                    "VVIX": "last",
-                    "VIX_SD20": "last",
-                    "VVIX_SD20": "last",
-                    "VIX_SD20_Z": "last",
-                    "VVIX_SD20_Z": "last",
-                    "Tsunami": "max",
-                }
-            )
-            .dropna(how="all")
-        )
+        df = df.resample("W-FRI").last()
+
+    df_recent = df.tail(365)
 
     fig = go.Figure()
 
     fig.add_trace(
         go.Scatter(
-            x=df.index,
-            y=df["VIX"],
+            x=df_recent.index,
+            y=df_recent["VIX"],
             mode="lines",
             name="VIX",
-            line=dict(width=2),
         )
     )
 
     fig.add_trace(
         go.Scatter(
-            x=df.index,
-            y=df["VIX_SD20"],
+            x=df_recent.index,
+            y=df_recent["VIX_SD20"],
             mode="lines",
             name="VIX 20-day stdev",
-            line=dict(width=1.5, dash="dash"),
+            line=dict(dash="dot"),
         )
     )
 
     fig.add_trace(
         go.Scatter(
-            x=df.index,
-            y=df["VVIX_SD20"],
+            x=df_recent.index,
+            y=df_recent["VVIX_SD20"],
             mode="lines",
             name="VVIX 20-day stdev",
-            line=dict(width=1.5, dash="dot"),
+            line=dict(dash="dot"),
         )
     )
 
-    # Mark Tsunami signals with red diamonds on the VIX line
-    tsu_points = df[df["Tsunami"]]
-    if not tsu_points.empty:
+    sig_mask = df_recent["signal"].fillna(False)
+    if sig_mask.any():
+        xs = df_recent.index[sig_mask]
+        ys = df_recent.loc[sig_mask, "VIX"]
         fig.add_trace(
             go.Scatter(
-                x=tsu_points.index,
-                y=tsu_points["VIX"],
+                x=xs,
+                y=ys,
                 mode="markers",
-                name="Tsunami signal",
-                marker=dict(symbol="diamond", size=9),
+                name="Tsunami compression",
+                marker=dict(symbol="diamond", size=10),
             )
         )
 
     fig.update_layout(
+        title="VIX & Volatility Tsunami Watch",
         height=400,
         margin=dict(l=40, r=20, t=50, b=40),
         showlegend=True,
-        xaxis_title="Date",
-        yaxis_title="VIX / Vol stats",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0.0,
+        ),
+    )
+    fig.update_xaxes(title="Date")
+    fig.update_yaxes(title="VIX")
+
+    return fig
+
+
+# ----------------------------
+# Price chart building (SPY/QQQ)
+# ----------------------------
+
+def build_price_chart(
+    df_full: pd.DataFrame,
+    title: str,
+    price_name: str,
+    canary_info: dict,
+    short_len: int = 21,
+    long_len: int = 200,
+    days_window: int = 65,
+) -> go.Figure:
+    """
+    Build a 3-month price chart with:
+    - Close
+    - short EMA (21-day)
+    - long EMA (200-day)
+    - markers for slow / fast / confirmed Canary events
+    """
+    df = df_full.copy()
+    df["EMA_short"] = ema(df["Close"], short_len)
+    df["EMA_long"] = ema(df["Close"], long_len)
+
+    df_recent = df.tail(days_window)
+    flags_full = canary_info["flags"]
+    flags_recent = flags_full.loc[df_recent.index]
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=df_recent.index,
+            y=df_recent["Close"],
+            mode="lines",
+            name=price_name,
+        )
     )
 
-    # Tsunami flashlight info (look-back window)
-    cutoff = df.index.max() - pd.Timedelta(days=TSUNAMI_LOOKBACK_DAYS)
-    recent = df[df.index >= cutoff]
-    recent_signals = recent[recent["Tsunami"]]
+    fig.add_trace(
+        go.Scatter(
+            x=df_recent.index,
+            y=df_recent["EMA_short"],
+            mode="lines",
+            name=f"{short_len}-day EMA",
+        )
+    )
 
-    if recent_signals.empty:
-        info = {
-            "label": "No Tsunami in window",
-            "color": "🟢",
-            "detail": f"No Tsunami signal in the last {TSUNAMI_LOOKBACK_DAYS} days.",
-        }
-    else:
-        last_date = recent_signals.index[-1].date()
-        info = {
-            "label": "Tsunami Warning",
-            "color": "🟠",
-            "detail": f"Last Tsunami signal on {last_date}.",
-        }
+    fig.add_trace(
+        go.Scatter(
+            x=df_recent.index,
+            y=df_recent["EMA_long"],
+            mode="lines",
+            name=f"{long_len}-day EMA",
+        )
+    )
 
-    return fig, info
+    # Canary markers
+    marker_styles = {
+        "slow": dict(symbol="circle", color="green"),
+        "fast": dict(symbol="triangle-up", color="orange"),
+        "confirmed": dict(symbol="diamond", color="red"),
+    }
+    labels = {
+        "slow": "Slow 5% (Buy-the-Dip)",
+        "fast": "Fast 5% drop",
+        "confirmed": "Confirmed Canary",
+    }
+
+    for key in ["slow", "fast", "confirmed"]:
+        mask = flags_recent[key].fillna(False)
+        if mask.any():
+            xs = flags_recent.index[mask]
+            ys = df_recent.loc[xs, "Close"]
+            style = marker_styles[key]
+            fig.add_trace(
+                go.Scatter(
+                    x=xs,
+                    y=ys,
+                    mode="markers",
+                    name=labels[key],
+                    marker=dict(
+                        symbol=style["symbol"],
+                        size=10,
+                        color=style["color"],
+                        line=dict(width=1, color="black"),
+                    ),
+                )
+            )
+
+    fig.update_layout(
+        title=title,
+        height=350,
+        margin=dict(l=40, r=20, t=50, b=40),
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0.0,
+        ),
+    )
+    fig.update_xaxes(title="Date")
+    fig.update_yaxes(title=price_name)
+
+    return fig
 
 
-# ------------------------------------------------------------------
-# Layout
-# ------------------------------------------------------------------
-
+# ----------------------------
+# Main app
+# ----------------------------
 
 def main():
+    st.set_page_config(
+        page_title="Market Risk Dashboard",
+        layout="wide",
+    )
+
     st.title("Market Risk Dashboard")
+    st.markdown("5% Canary • Volatility Tsunami • Cross-Asset Regimes")
 
-    st.caption("5% Canary • Volatility Tsunami • Cross-Asset Regimes")
+    # Load data
+    spy_full, qqq_full, vix_full, vvix_full = load_data()
 
-    # ------------------------------------------------------------------
-    # Load data (cached by Streamlit)
-    # ------------------------------------------------------------------
+    # Signals
+    spy_canary = detect_canary(spy_full)
+    qqq_canary = detect_canary(qqq_full)
 
-    @st.cache_data(show_spinner=True)
-    def load_all():
-        spy = load_price_history("SPY", START_DATE)
-        qqq = load_price_history("QQQ", START_DATE)
-        vix_df = load_vix_vvix(START_DATE)
-        return spy, qqq, vix_df
+    tsunami_df = compute_tsunami_daily(vix_full, vvix_full)
+    tsu_info = tsunami_status(tsunami_df, window_days=120)
 
-    spy_full, qqq_full, vix_full = load_all()
+    # ---------------- Top summary row ----------------
+    col1, col2, col3 = st.columns(3)
 
-    # ------------------------------------------------------------------
-    # Canary / Tsunami / Snapshot summary
-    # ------------------------------------------------------------------
-
-    col_canary, col_tsunami, col_snapshot, col_breadth = st.columns(4)
-
-    # Canary info from SPY
-    spy_canary_info = canary_regime_from_close(
-        spy_full["Close"], spy_full["EMA200"], dd_threshold=-5.0
-    )
-
-    with col_canary:
+    # Canary Status
+    with col1:
         st.subheader("Canary Status")
-        st.markdown(f"{spy_canary_info['color']}  **{spy_canary_info['label']}**")
+        emoji, text = canary_panel_text(spy_canary, spy_full)
+        st.markdown(f"{emoji} {text}")
 
-    # Tsunami info
-    _, tsunami_info = build_vix_chart(vix_full, timeframe="Daily")
-
-    with col_tsunami:
+    # Tsunami Status
+    with col2:
         st.subheader("Tsunami Status")
-        st.markdown(f"{tsunami_info['color']}  **{tsunami_info['label']}**")
-        st.caption(tsunami_info["detail"])
+        if tsu_info["has_signal"]:
+            date_str = tsu_info["last_date"].strftime("%Y-%m-d")
+            st.markdown(
+                f"🟡 Tsunami compression signal on **{date_str}** "
+                f"(within last 120 days)."
+            )
+        else:
+            st.markdown("🟢 No Tsunami in window")
+            st.caption("No Tsunami signal in the last 120 days.")
 
-    # Market snapshot (SPY, QQQ, % off high)
+    # Market Snapshot
     with col3:
-    st.subheader("Market Snapshot")
+        st.subheader("Market Snapshot")
 
-    # Latest prices
-    spy_last = float(spy_full["Close"].iloc[-1])
-    qqq_last = float(qqq_full["Close"].iloc[-1])
+        spy_last = last_close(spy_full)
+        qqq_last = last_close(qqq_full)
+        spy_off = pct_off_high(spy_full["Close"])
+        qqq_off = pct_off_high(qqq_full["Close"])
+        vix_last = float(vix_full["Close"].iloc[-1])
 
-    # % off 52-week high
-    spy_off = pct_off_high(spy_full["Close"])
-    qqq_off = pct_off_high(qqq_full["Close"])
+        st.write(f"SPY: {spy_last:.2f}")
+        st.write(f"Off 52-week high: {spy_off:.1f}%")
 
-    st.write(f"SPY: {spy_last:,.2f}")
-    st.write(f"Off 52-week high: {spy_off:.1f}%")
+        st.write(f"QQQ: {qqq_last:.2f}")
+        st.write(f"Off 52-week high: {qqq_off:.1f}%")
 
-    st.write(f"QQQ: {qqq_last:,.2f}")
-    st.write(f"QQQ off 52-week high: {qqq_off:.1f}%")
-
-    # VIX snapshot
-    vix_last = float(vix_full["Close"].iloc[-1])
-    st.write(f"VIX: {vix_last:.2f}")
-
-    # Breadth proxy via % above 50-EMA (approx using 50-day EMA via EWM)
-    with col_breadth:
-        st.subheader("Breadth (Proxy)")
-        for name, df in [("SPY", spy_full), ("QQQ", qqq_full)]:
-            ema50 = df["Close"].ewm(span=50, adjust=False).mean()
-            above = (df["Close"].iloc[-1] > ema50.iloc[-1])
-            status = "Above 50-EMA" if above else "Below 50-EMA"
-            dot = "🟢" if above else "🔴"
-            st.write(f"{dot} {name}: {status}")
+        st.write(f"VIX: {vix_last:.2f}")
 
     st.markdown("---")
 
-    # ------------------------------------------------------------------
-    # SPY & QQQ price panels
-    # ------------------------------------------------------------------
-
-    st.subheader("SPY with 5% Canary Signals")
-    spy_fig, spy_canary_chart_info = build_price_chart(
-        spy_full, "SPY Price", "SPY", lookback_days=LOOKBACK_DAYS_PRICE
+    # ---------------- SPY & QQQ charts ----------------
+    spy_fig = build_price_chart(
+        spy_full,
+        "SPY with 5% Canary Signals",
+        "SPY Price",
+        spy_canary,
     )
+    qqq_fig = build_price_chart(
+        qqq_full,
+        "QQQ (NASDAQ) with 5% Canary Signals",
+        "QQQ Price",
+        qqq_canary,
+    )
+
     st.plotly_chart(spy_fig, use_container_width=True)
-    st.caption(spy_canary_chart_info["subtitle"])
-
-    st.subheader("QQQ (NASDAQ) with 5% Canary Signals")
-    qqq_fig, _ = build_price_chart(
-        qqq_full, "QQQ Price", "QQQ", lookback_days=LOOKBACK_DAYS_PRICE
-    )
     st.plotly_chart(qqq_fig, use_container_width=True)
-    st.caption("Blue: price, Orange: 21-day EMA, Green: 200-day EMA.")
 
     st.markdown("---")
 
-    # ------------------------------------------------------------------
-    # VIX & Tsunami panel
-    # ------------------------------------------------------------------
+    # ---------------- VIX & Tsunami chart ----------------
+    st.markdown("### VIX & Volatility Tsunami Watch")
+    timeframe = st.radio("VIX timeframe", ("Daily", "Weekly"), horizontal=True)
 
-    st.subheader("VIX & Volatility Tsunami Watch")
-
-    timeframe = st.radio(
-        "VIX timeframe", ["Daily", "Weekly"], horizontal=True, index=0
-    )
-
-    vix_fig, _ = build_vix_chart(vix_full, timeframe=timeframe)
+    vix_fig = build_vix_chart(tsunami_df, timeframe)
     st.plotly_chart(vix_fig, use_container_width=True)
     st.caption(
         "Lines: VIX, VIX 20-day stdev, VVIX 20-day stdev. "
