@@ -6,27 +6,56 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 
-
-# ----------------------------
-# Data loading & basic helpers
-# ----------------------------
-
-@st.cache_data(ttl=3600)
+# --- Data loading ----------------------------------------------------------
+@st.cache_data(ttl=60 * 30, show_spinner=False)
 def load_data():
-    """Download SPY, QQQ, VIX, VVIX with enough history for EMAs and signals."""
-    end = dt.date.today()
-    start = end - dt.timedelta(days=800)  # a bit over 3 years
+    """Download full history for SPY, QQQ, VIX and VVIX and normalise columns.
 
-    spy = yf.download("SPY", start=start, end=end, progress=False)
-    qqq = yf.download("QQQ", start=start, end=end, progress=False)
-    vix = yf.download("^VIX", start=start, end=end, progress=False)
-    vvix = yf.download("^VVIX", start=start, end=end, progress=False)
+    We keep full history for EMA calculations and only slice for plotting.
+    """
 
-    # Just in case, drop any rows without Close data
-    spy = spy.dropna(subset=["Close"])
-    qqq = qqq.dropna(subset=["Close"])
-    vix = vix.dropna(subset=["Close"])
-    vvix = vvix.dropna(subset=["Close"])
+    end = datetime.today() + timedelta(days=1)
+    start = end - timedelta(days=365 * 3)
+
+    def fetch(symbol: str) -> pd.DataFrame:
+        df = yf.download(
+            symbol,
+            start=start,
+            end=end,
+            progress=False,
+            auto_adjust=False,  # keep raw OHLC so columns are predictable
+        )
+
+        # If yfinance returns a MultiIndex (some versions do), collapse it
+        if isinstance(df.columns, pd.MultiIndex):
+            # For a single symbol yfinance usually puts the ticker in level 0
+            if df.columns.nlevels == 2 and len(df.columns.levels[0]) == 1:
+                df = df.xs(df.columns.levels[0][0], axis=1)
+
+        # Normalise the "Close" column name
+        if "Close" not in df.columns:
+            if "Adj Close" in df.columns:
+                df = df.rename(columns={"Adj Close": "Close"})
+            else:
+                # This is very defensive; if it ever triggers we'll see the columns
+                raise KeyError(
+                    f"{symbol}: no 'Close' or 'Adj Close' column. "
+                    f"Got columns: {list(df.columns)}"
+                )
+
+        # Clean up index and sort
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+
+        # Drop rows where we don't have a close
+        df = df.dropna(subset=["Close"])
+
+        return df
+
+    spy = fetch("SPY")
+    qqq = fetch("QQQ")
+    vix = fetch("^VIX")
+    vvix = fetch("^VVIX")
 
     return spy, qqq, vix, vvix
 
