@@ -368,58 +368,91 @@ price_scale_choice = st.radio(
 )
 
 def make_price_chart(close_series, canary_df, label, scale_choice):
+    """
+    Build price chart with inline legend and auto-fit y-scale w/ padding.
+    """
     df = pd.DataFrame({"close": close_series})
     df["Date"] = df.index
 
     if tf_choice == "Daily":
         df["ema_short"] = ema(df["close"], 21)
         df["ema_long"] = ema(df["close"], 200)
+        short_label = "21-day EMA"
+        long_label = "200-day EMA"
     else:  # Weekly
         df["ema_short"] = ema(df["close"], 10)
         df["ema_long"] = ema(df["close"], 40)
+        short_label = "10-week EMA"
+        long_label = "40-week EMA"
 
     merged = df.set_index("Date").join(
         canary_df[["slow_canary", "fast_canary", "confirmed_canary"]]
     )
     merged = merged.reset_index().rename(columns={"index": "Date"})
 
-    base = alt.Chart(merged).properties(height=350)
+    # ---- Legend: melt to long form so Altair can create a color legend ----
+    line_df = merged.melt(
+        id_vars=["Date", "slow_canary", "fast_canary", "confirmed_canary"],
+        value_vars=["close", "ema_short", "ema_long"],
+        var_name="line",
+        value_name="value",
+    )
+
+    line_df["line"] = line_df["line"].map({
+        "close": "Price",
+        "ema_short": short_label,
+        "ema_long": long_label,
+    })
+
+    # ---- Auto-fit y-scale with small padding (similar to Plotly snippet) ----
+    y_min = line_df["value"].min()
+    y_max = line_df["value"].max()
+    pad = (y_max - y_min) * 0.05 if pd.notnull(y_max) else 0.0
 
     scale_type = "log" if scale_choice == "Log" else "linear"
-    y_scale = alt.Scale(zero=False, type=scale_type)
 
-    price_line = base.mark_line(color="#4CC9F0", strokeWidth=2).encode(
-        x="Date:T",
-        y=alt.Y("close:Q", title=f"{label} Price", scale=y_scale)
+    if pad > 0:
+        y_domain = [float(y_min - pad), float(y_max + pad)]
+        y_scale = alt.Scale(zero=False, type=scale_type, domain=y_domain)
+    else:
+        # Fallback: let Altair choose if data is degenerate
+        y_scale = alt.Scale(zero=False, type=scale_type)
+
+    base_lines = alt.Chart(line_df).properties(height=350)
+
+    color_scale = alt.Scale(
+        domain=["Price", short_label, long_label],
+        range=["#4CC9F0", "#F9C74F", "#90BE6D"],
     )
 
-    ema_short_line = base.mark_line(color="#F9C74F", strokeWidth=1.5).encode(
+    lines = base_lines.mark_line(strokeWidth=2).encode(
         x="Date:T",
-        y=alt.Y("ema_short:Q", scale=y_scale),
-        tooltip=["Date:T", "close:Q"]
+        y=alt.Y("value:Q", title=f"{label} Price", scale=y_scale),
+        color=alt.Color("line:N", scale=color_scale, title=None),
+        tooltip=[
+            "Date:T",
+            "line:N",
+            alt.Tooltip("value:Q", format=".2f"),
+        ],
     )
 
-    ema_long_line = base.mark_line(color="#90BE6D", strokeWidth=1.5).encode(
+    # Canary points use the same y-scale
+    base_pts = alt.Chart(merged).encode(
         x="Date:T",
-        y=alt.Y("ema_long:Q", scale=y_scale)
+        y=alt.Y("close:Q", scale=y_scale),
     )
 
-    slow_pts = base.mark_point(color="green", size=60).encode(
-        x="Date:T",
-        y=alt.Y("close:Q", scale=y_scale),
-    ).transform_filter("datum.slow_canary == true")
+    slow_pts = base_pts.mark_point(color="green", size=60).transform_filter(
+        "datum.slow_canary == true"
+    )
+    fast_pts = base_pts.mark_point(color="orange", size=80, shape="triangle-up").transform_filter(
+        "datum.fast_canary == true"
+    )
+    conf_pts = base_pts.mark_point(color="red", size=100, shape="diamond").transform_filter(
+        "datum.confirmed_canary == true"
+    )
 
-    fast_pts = base.mark_point(color="orange", size=80, shape="triangle-up").encode(
-        x="Date:T",
-        y=alt.Y("close:Q", scale=y_scale),
-    ).transform_filter("datum.fast_canary == true")
-
-    conf_pts = base.mark_point(color="red", size=100, shape="diamond").encode(
-        x="Date:T",
-        y=alt.Y("close:Q", scale=y_scale),
-    ).transform_filter("datum.confirmed_canary == true")
-
-    chart = price_line + ema_short_line + ema_long_line + slow_pts + fast_pts + conf_pts
+    chart = lines + slow_pts + fast_pts + conf_pts
     return chart
 
 # Resample for weekly if needed
