@@ -52,10 +52,7 @@ def off_high(series, lookback=252):
     return (series / roll_high - 1.0) * 100
 
 def pct_above_ema50_proxy(close_series):
-    """
-    Simple v1 breadth proxy:
-    100% if close > 50-EMA, else 0%.
-    """
+    """Simple v1 breadth proxy: 100% if close > 50-EMA, else 0%."""
     ema50 = ema(close_series, 50)
     above = close_series.iloc[-1] > ema50.iloc[-1]
     return 100.0 if above else 0.0
@@ -173,6 +170,7 @@ def compute_tsunami(vix_close,
 
 tsu_df = compute_tsunami(vix, vvix)
 
+last_tsu_date = None
 if len(tsu_df.dropna()) > 0 and tsu_df["tsunami"].any():
     last_tsu_date = tsu_df[tsu_df["tsunami"]].index[-1].date()
     tsunami_state_text = f"Tsunami WARNING (last: {last_tsu_date})"
@@ -362,7 +360,14 @@ tf_choice = st.radio(
     key="tf_prices"
 )
 
-def make_price_chart(close_series, canary_df, label):
+price_scale_choice = st.radio(
+    "Price y-axis scale",
+    ["Linear", "Log"],
+    horizontal=True,
+    key="price_scale"
+)
+
+def make_price_chart(close_series, canary_df, label, scale_choice):
     df = pd.DataFrame({"close": close_series})
     df["Date"] = df.index
 
@@ -380,35 +385,38 @@ def make_price_chart(close_series, canary_df, label):
 
     base = alt.Chart(merged).properties(height=350)
 
+    scale_type = "log" if scale_choice == "Log" else "linear"
+    y_scale = alt.Scale(zero=False, type=scale_type)
+
     price_line = base.mark_line(color="#4CC9F0", strokeWidth=2).encode(
         x="Date:T",
-        y=alt.Y("close:Q", title=f"{label} Price")
+        y=alt.Y("close:Q", title=f"{label} Price", scale=y_scale)
     )
 
     ema_short_line = base.mark_line(color="#F9C74F", strokeWidth=1.5).encode(
         x="Date:T",
-        y="ema_short:Q",
+        y=alt.Y("ema_short:Q", scale=y_scale),
         tooltip=["Date:T", "close:Q"]
     )
 
     ema_long_line = base.mark_line(color="#90BE6D", strokeWidth=1.5).encode(
         x="Date:T",
-        y="ema_long:Q"
+        y=alt.Y("ema_long:Q", scale=y_scale)
     )
 
     slow_pts = base.mark_point(color="green", size=60).encode(
         x="Date:T",
-        y="close:Q",
+        y=alt.Y("close:Q", scale=y_scale),
     ).transform_filter("datum.slow_canary == true")
 
     fast_pts = base.mark_point(color="orange", size=80, shape="triangle-up").encode(
         x="Date:T",
-        y="close:Q",
+        y=alt.Y("close:Q", scale=y_scale),
     ).transform_filter("datum.fast_canary == true")
 
     conf_pts = base.mark_point(color="red", size=100, shape="diamond").encode(
         x="Date:T",
-        y="close:Q",
+        y=alt.Y("close:Q", scale=y_scale),
     ).transform_filter("datum.confirmed_canary == true")
 
     chart = price_line + ema_short_line + ema_long_line + slow_pts + fast_pts + conf_pts
@@ -430,7 +438,7 @@ else:
     qqq_can_tf = qqq_canary
     spy_regime_tf = spy_regime
 
-# 🔍 Limit to last ~3 months on price charts (fixed: use Timestamp)
+# 🔍 Limit to last ~3 months on price charts
 lookback_days = 90
 cutoff = pd.Timestamp(end_date - dt.timedelta(days=lookback_days))
 
@@ -452,9 +460,14 @@ with spy_col2:
     st.markdown(f"### {light}")
 
 st.altair_chart(
-    make_price_chart(spy_tf, spy_can_tf, "SPY"),
+    make_price_chart(spy_tf, spy_can_tf, "SPY", price_scale_choice),
     use_container_width=True
 )
+
+if tf_choice == "Daily":
+    st.caption("SPY: Blue = price, Yellow = 21-day EMA, Green = 200-day EMA.")
+else:
+    st.caption("SPY: Blue = price, Yellow = 10-week EMA, Green = 40-week EMA.")
 
 # QQQ chart
 qqq_regime = regime_series(qqq_can_tf, tsu_df)
@@ -466,9 +479,14 @@ with qqq_col2:
     st.markdown(f"### {light}")
 
 st.altair_chart(
-    make_price_chart(qqq_tf, qqq_can_tf, "QQQ"),
+    make_price_chart(qqq_tf, qqq_can_tf, "QQQ", price_scale_choice),
     use_container_width=True
 )
+
+if tf_choice == "Daily":
+    st.caption("QQQ: Blue = price, Yellow = 21-day EMA, Green = 200-day EMA.")
+else:
+    st.caption("QQQ: Blue = price, Yellow = 10-week EMA, Green = 40-week EMA.")
 
 st.markdown("---")
 
@@ -491,7 +509,19 @@ else:
     vvix_tf = vvix
     tsu_tf = tsu_df
 
-st.subheader("VIX & Volatility Tsunami Watch")
+vix_col1, vix_col2 = st.columns([4, 1])
+with vix_col1:
+    st.subheader("VIX & Volatility Tsunami Watch")
+with vix_col2:
+    # Flashlight style indicator for Tsunami status
+    if tsunami_active:
+        light_vix = "🟣"
+        label_vix = f"Last Tsunami: {last_tsu_date}" if last_tsu_date else "Tsunami active"
+    else:
+        light_vix = "🟢"
+        label_vix = "No Tsunami in window"
+    st.markdown(f"### {light_vix}")
+    st.caption(label_vix)
 
 vix_plot_df = pd.DataFrame({"Date": vix_tf.index, "VIX": vix_tf.values})
 tsu_join = tsu_tf.reindex(vix_plot_df["Date"]).reset_index(drop=True)
@@ -508,7 +538,7 @@ base_vix = alt.Chart(vix_plot_df).properties(height=350)
 
 vix_line = base_vix.mark_line(color="#4CC9F0", strokeWidth=2).encode(
     x="Date:T",
-    y=alt.Y("VIX:Q", title="VIX")
+    y=alt.Y("VIX:Q", title="VIX", scale=alt.Scale(zero=False))
 )
 
 vix_sd_line = base_vix.mark_line(color="#F9C74F", strokeDash=[4, 4]).encode(
@@ -532,9 +562,9 @@ st.altair_chart(
 )
 
 st.caption(
-    "Blue: VIX. Yellow/Green: 20-day stdev of VIX/VVIX. "
-    "Red diamonds: Volatility Tsunami compression signals."
+    "Blue = VIX. Yellow = 20-day stdev of VIX. Green = 20-day stdev of VVIX. "
+    "Red diamonds = Volatility Tsunami compression signals."
 )
 
 st.markdown("---")
-st.caption("v2 – Trend, Canary, Tsunami & Cross-Asset snapshot. Next: candlesticks, swing lows, richer breadth.")
+st.caption("v3 – Trend, Canary, Tsunami & Cross-Asset snapshot (with zoomed y-axis and log option).")
