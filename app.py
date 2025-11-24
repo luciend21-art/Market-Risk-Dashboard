@@ -603,5 +603,3 @@ st.caption(
 
 st.markdown("---")
 st.caption("v3 – Trend, Canary, Tsunami & Cross-Asset snapshot (with zoomed y-axis and log option).")
-
-if __name__ == "__main__":
